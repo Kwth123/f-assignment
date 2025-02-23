@@ -1,0 +1,3 @@
+#!/bin/bash
+dotnet tool install --global Microsoft.dotnet-interactive
+dotnet interactive jupyter install
