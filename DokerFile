@@ -1,0 +1,11 @@
+FROM mcr.microsoft.com/dotnet/sdk:6.0
+
+# Install .NET Interactive (F# Kernel)
+RUN dotnet tool install --global Microsoft.dotnet-interactive
+RUN dotnet interactive jupyter install
+
+# Set environment variables
+ENV PATH="${PATH}:/root/.dotnet/tools"
+
+# Start Jupyter Notebook
+CMD ["jupyter", "notebook", "--ip=0.0.0.0", "--allow-root"]
