@@ -1,0 +1,651 @@
+#!meta
+
+{"kernelInfo":{"defaultKernelName":"csharp","items":[{"aliases":[],"name":"csharp"}]}}
+
+#!fsharp
+
+#r "nuget:Deedle"
+#r "nuget: Plotly.NET, 4.2.0"
+#r "nuget: Plotly.NET.Interactive, 4.2.1"
+#r "nuget: FSharp.Stats, 0.5.0"
+
+#!fsharp
+
+open Deedle
+open Plotly.NET
+open FSharp.Stats
+open FSharp.Stats.Signal
+open FSharp.Stats.Signal.QQPlot
+open FSharp.Stats.Testing
+open FSharp.Stats.Fitting
+open FSharp.Stats.Fitting.LinearRegression
+open FSharp.Stats.Correlation
+open FSharp.Stats.Distributions
+
+#!fsharp
+
+//===========================================================
+// Function to calculate R2: The Coefficient of Determination
+//===========================================================
+// xs: Input - A sequence of x values
+// ys: Input - A sequence of y values
+let R2 xs ys =
+  let n = ys |> Seq.length
+  let nExy = (float n) * ( (xs, ys) ||> Seq.map2 (fun x y -> x * y) |> Seq.sum )
+  let ExEy = (xs |> Seq.sum ) * (ys |> Seq.sum)
+  let Ex_2 = xs |> Seq.map (fun x -> x * x) |> Seq.sum
+  let Ey_2 = ys |> Seq.map (fun y -> y * y) |> Seq.sum
+  let Ex2 = (xs |> Seq.sum) * (xs |> Seq.sum)
+  let Ey2 = (ys |> Seq.sum) * (ys |> Seq.sum)
+
+  let R = (nExy - ExEy) / ( (sqrt ( (float n) * Ex_2 - Ex2 )) * (sqrt ( (float n) * Ey_2 - Ey2 )) )
+  R*R
+
+#!fsharp
+
+//=================================================================== 
+// Generate a simple random sample of num_samples from a data frame
+// Input: 
+//    num_samples: The number of samples to select at random from
+//                 data frame 'frame'.
+//    frame      : The data frame from which the samples are selected
+//
+// Outpout: a new frame consisting of `num_samples` rows.
+//===================================================================
+let simpleRandomSample num_samples (frame: Frame<'K, 'R>) =
+  let rand count max = 
+    let mutable samples = Array.init num_samples (fun x -> 0)
+    let n = count
+    let N = max
+    let mutable t = 0
+    let mutable m = 0
+    let mutable u = 0.0
+    let mutable continue_looping = true
+    while continue_looping do
+      u <- System.Random().NextDouble()
+      let left = (float (N - t)) * u
+      let right = float (n - m)
+      if ( left >= right )
+      then t <- t + 1
+      else
+        samples[m] <- t
+        t <- t + 1
+        m <- m + 1
+      if m >= n then
+        continue_looping <- false
+    samples
+
+  let reindexed_frame = Frame.indexRowsOrdinally frame
+  let inds = rand num_samples (reindexed_frame.RowCount-1)
+  Frame.sliceRows inds reindexed_frame
+
+#!fsharp
+
+//============================================================================= 
+// Generate a stratified random sample of num_samples from a data frame
+// Input: 
+//    fraction   : The fraction of the sample size per group in the data frame
+//    column_name: The name of the column by which to group the samples
+//    frame      : The data frame from which the samples are selected
+//
+// Outpout: a new frame consisting of `num_samples` rows.
+//============================================================================
+
+let stratifiedRandomSample fraction column_name (frame: Frame<'K, 'R>) =
+  let total_rows = frame.RowCount
+  let fraction = fraction/100.0
+  let total_sampled_df = (fraction * (float total_rows)) |> ceil
+  let grouped_df = frame |> Frame.groupRowsByString column_name
+  let d3 = grouped_df |> Frame.nest
+  let num_groups = d3.KeyCount
+
+  let stratified_sample =
+    [
+      for i in 0..(num_groups-1) do
+        let group_frame = d3.GetAt(i)
+        let nitems = group_frame.RowCount
+        let sample_size =  (float nitems * fraction) |> ceil |> int
+        group_frame |> simpleRandomSample sample_size
+    ] |> Frame.mergeAll
+
+  stratified_sample
+
+#!fsharp
+
+// ==========================================================================================================
+// Compute the confidence interval for two independent samples, i.e., two populations only BY MEANS!!!!!!
+// Input: 
+//    samplea   : A series/column represnting the first sample or population
+//    sampleb   : A series/column represnting the second sample or population
+//
+// Output: The confidence interval for the two independent samples.
+//
+// https://sphweb.bumc.bu.edu/otlt/mph-modules/bs/bs704_confidence_intervals/bs704_confidence_intervals5.html
+// ==========================================================================================================
+
+let twoSampleConfidenceInterval (samplea: Series<int, float>) (sampleb: Series<int, float>) =
+  let na = float samplea.ValueCount
+  let nb = float sampleb.ValueCount
+  let sa = float (Stats.stdDev samplea)
+  let sb = float (Stats.stdDev sampleb)
+  let meana = Stats.mean samplea
+  let meanb = Stats.mean sampleb
+
+  let sp = 
+    ((na - 1.0) * sa * sa + (nb - 1.0) * sb * sb) / (na + nb - 2.0)
+    |> sqrt
+  
+  let lower = (meana - meanb) + 1.96 * sp * sqrt (1.0/na + 1.0/nb)
+  let upper = (meana - meanb) - 1.96 * sp * sqrt (1.0/na + 1.0/nb)
+  printfn "CI = (%A, %A)" upper lower
+
+#!fsharp
+
+// ===========================================================================================================================
+// Compute the confidence interval for two independent samples, i.e., two populations only BY PROPORTION !!!!
+// Input: 
+//    proportion_from_population1: Example: number of females that survived / total number of females 
+//    total_population1          : Example Total number of females
+//    proportion_from_population2: Example: number of males that survived / total number of males
+//    total_population2          : Example Total number of males
+//
+// Output: The confidence interval for the two independent samples by PROPORTION.
+//
+// https://sphweb.bumc.bu.edu/otlt/mph-modules/bs/bs704_confidence_intervals/BS704_Confidence_Intervals7.html#headingtaglink_4
+// ===========================================================================================================================
+
+let twoSampleConfidenceIntervalPopulationProportion proportion_from_population1 total_population1 proportion_from_population2 total_population2 =
+  let n1 = float total_population1
+  let n2 = float total_population2
+  let p1 =  proportion_from_population1
+  let p2 =  proportion_from_population2
+
+  let lower = p1 - p2 + 1.96 * sqrt ((p1 * (1.0-p1) / n1) + (p2 * (1.0-p2) / n2)) |> abs
+  let upper = p1 - p2 - 1.96 * sqrt ((p1 * (1.0-p1) / n1) + (p2 * (1.0-p2) / n2)) |> abs
+
+  printfn "CI = (%A, %A)" lower upper
+
+#!markdown
+
+#### PROJECT 1: Does Brain Weight Differ by Age in Healthy Adult Humans?
+The Brainhead.csv dataset provides information on 237 individuals who were subject to postmortem examination at the Middlesex Hospital in London around the turn of the 20th century [1]. Study authors used cadavers to see if a relationship between brain weight and other more easily measured physiological characterizes such as age, sex, and head size could be determined. The end goal was to develop a way to estimate a person's brain size while they were still alive (as the living aren't keen on having their brains taken out and weighed). We wish to determine if there is a relationship between age and brain weight in healthy human adults.
+
+##### Project deliverables:
+1. Import the Brainhead.csv dataset. Review the data dictionary to identify each variable in the dataset as categorical or quantitative. If the variable is categorical, further identify it as ordinal, nominal, or an identifier variable. If the variable is quantitative, identify it as discrete or continuous. `(8 marks)`
+
+2. Create a histogram of brain weight and calculate the appropriate summary measures to describe the distribution. `(3 marks)`
+
+3. Display the distribution of age graphically. `(2 marks)`
+
+4. Describe the distribution of age with a numerical summary. `(1 mark)`
+
+5. Draw side-by-side box plots illustrating the distribution of brain weight by age. `(5 marks)`
+
+  `Hint: Step 1. Use Frame.filterRows to create two data frames - a dataframe for the younger than 46 group and another dataframe for the older than 46 group.`
+	
+	For example, for a data frame called 'furniture_df' where 'desks' are labelled 1 and 'chairs' are lableled 2. I can extract a dataframe with just data for desks using:
+	
+	      let desks_df = furniture_df |> Frame.filterRows (fun key row -> row?desks = 1)
+	
+	`Hint: Step 2. From each dataframe you created, extract just the Brain column`
+
+	`Hint: Step 3. Create two boxplots and combine them.`
+
+6. Calculate and compare the mean and standard deviation of brain weight by age. `(5 marks)`
+
+7. Describe the hypothesis test you would use to test for a statistically significant difference in brain weight by age. `(2 marks)`
+
+8. Identify the appropriate statistical test for your hypotheses in Deliverable 7, and determine if the assumptions for using this test are met. `(3 marks)`
+
+9. Test for a statistically significant difference in brain weight by age at the 0.05 level. `(3 marks)`
+
+10. Calculate a 95% confidence interval for the difference in the mean brain weight for older and younger individuals. `(2 marks)`
+
+11. Summarise your results about the relationship of age and brain weight in healthy adults. `(2 marks)`
+
+##### REFERENCE
+[1]. Gladstone, R. J. (1905). “A Study of the Relations of the Brain to the Size of the Head,” Biometrika, Vol. 4, pp. 105–123.
+
+#!markdown
+
+1. Import the Brainhead.csv dataset. Review the data dictionary to identify each variable in the dataset as categorical or quantitative. If the variable is categorical, further identify it as ordinal, nominal, or an identifier variable. If the variable is quantitative, identify it as discrete or continuous. `(8 marks)`
+
+#!fsharp
+
+let brainhead = Frame.ReadCsv("Brainhead.csv")//, separators=",")
+brainhead.Print()
+
+#!markdown
+
+Gender is categorical nominal. 
+(Categorical as its categorizing people into genders, its nominal as 1 is for male and 2 is for female)
+
+Age is categorical ordinal. 
+(Categorical as its categorizing people into many ages, its ordinal as 1 is the 20 to 46 group and 2 for older over 46's)
+
+Head is quantitative continuous. 
+(Qantitative as its size is in cm^3, its continuous as centimetres can be any number)
+
+Brain is quantitative continuous. 
+(Qantitative as its weight is in in grams, its continuous as grams can be any number)
+
+#!markdown
+
+2. Create a histogram of brain weight and calculate the appropriate summary measures to describe the distribution. `(3 marks)`
+
+#!fsharp
+
+Chart.Histogram(brainhead?Brain.Values) //, NBinsX=10)
+|> Chart.withXAxisStyle (TitleText = "Brain Weight")
+|> Chart.withYAxisStyle (TitleText = "Frequency")
+
+#!fsharp
+
+let braininfo = brainhead?Brain
+Stats.describe braininfo
+
+#!markdown
+
+[mean, 1282.873417721519], [std, 120.3404457864572]
+
+The mean brain is 1282.873g (3d.p) and has a standard deviation of 120.34g (2d.p).
+
+[min, 955]  [max, 1635]
+
+Brain weights range from a minimum of 955g to a maximum of 1635g.
+
+[0.25, 1207], [0.5, 1280], [0.75, 1350]
+
+Quarter 1 is at 1207g, the mean at 1280g and quarter 3 at 1350g.
+
+Thanks to the graph you can tell it somewhat normaly distrobuted, it doesnt fit a bell shape yet has some symetry.
+
+#!markdown
+
+3. Display the distribution of age graphically. `(2 marks)`
+
+#!fsharp
+
+let total = brainhead.RowCount
+let age_series = brainhead.GetColumn<string>("Age")
+let ones = age_series |> Series.filterValues (fun v -> v = "1") |> Series.countValues
+let twos = total - ones
+
+let age_result_frequency = Series.ofObservations [ "age less than 46 (%)" => (float ones) * 100.0/(float total); "age greater than 46(%)" => (float twos) * 100.0/(float total) ]
+age_result_frequency.Print()
+
+Chart.Bar(age_result_frequency |> Series.observations)
+|> Chart.withXAxisStyle (TitleText = "Percentage")
+|> Chart.withYAxisStyle (TitleText = "Age")
+
+#!markdown
+
+4. Describe the distribution of age with a numerical summary. `(1 mark)`
+
+#!fsharp
+
+let ageinfo = brainhead?Age
+Stats.describe ageinfo
+
+#!markdown
+
+[mean, 1.5358649789029535], [std, 0.4997675208658458](1 is 20-46's, 20 is 46's and above)
+[min, 1], [0.25, 1], [0.5, 2], [0.75, 2], 
+
+The above data suggetest that the data set is slightly skewed to having more over 46's, with the mean being almost halfway between the end of 20-46's participants and over 46's
+
+age less than 46 (%)   -> 46.413502109704645 
+age greater than 46(%) -> 53.586497890295355 
+
+As we can see from the bar chart, there are 46.414%(3d.p) of 20-46's and 53.586%(3d.p) of over 46's.
+There are more over 46's in the data set than there are 20-46's, by 7.1729%(4d.p)
+
+#!markdown
+
+5. Draw side-by-side box plots illustrating the distribution of brain weight by age. `(5 marks)`
+
+ `Hint: Step 1. Use Frame.filterRows to create two data frames - a dataframe for the younger than 46 group and another dataframe for the older than 46 group.`
+	
+	For example, for a data frame called 'furniture_df' where 'desks' are labelled 1 and 'chairs' are lableled 2. I can extract a dataframe with just data for desks using:
+	
+	      let desks_df = furniture_df |> Frame.filterRows (fun key row -> row?desks = 1)
+	
+	`Hint: Step 2. From each dataframe you created, extract just the Brain column`
+
+	`Hint: Step 3. Create two boxplots and combine them.`
+
+#!fsharp
+
+let younger_df = brainhead |> Frame.filterRows  (fun key row -> row?Age = 1)
+let older_df = brainhead |> Frame.filterRows (fun key row -> row?Age = 2)
+let transposedDF = older_df.Transpose()
+transposedDF.Print()
+
+[ Chart.Bar(younger_df.GetColumn<int>("Age") |> Series.observations)//I couldnt get it to work with the transposed dataframes :/
+  Chart.Bar(older_df.GetColumn<int>("Age") |> Series.observations)]
+|> Chart.combine
+|> Chart.withXAxisStyle (TitleText = "Age")
+|> Chart.withYAxisStyle (TitleText = "Frequency") 
+
+#!markdown
+
+6. Calculate and compare the mean and standard deviation of brain weight by age. `(5 marks)`
+
+#!fsharp
+
+let braininforyoung = younger_df?Brain
+Stats.describe braininfo
+
+#!fsharp
+
+let braininforold = older_df?Brain
+Stats.describe braininforold
+
+#!markdown
+
+young = [mean, 1282.873417721519], [std, 120.3404457864572]
+old = [mean, 1263.9370078740158], [std, 120.92571168503282]
+
+20-46's have a mean of 1282.873(3d.p) and a standard devation of 120.340(3d.p).
+over 46's have a mean of 1263.937(3d.p) and a standard devation of 120.926(3d.p).
+
+The mean brain weight of the 20-46's is 18.936g (3d.p) higher than over 46's.
+The standard deviation of brain weight of the 20-46's group is 0.585g (3d.p) higher than the older over 46's.
+
+The under 46 group has on average heavier brains than over 46's meaning we loose brain mass as we age.
+The under 46 group is a little more variability in their brain weight.
+
+#!csharp
+
+//from here on onwards, questions will be in the code boxes. e.g //1. Import the Treckers.csv dataset. Op...
+
+#!markdown
+
+#### PROJECT 2: Preventing Acute Mountain Sickness with Ginkgo Biloba and Acetazolamide
+
+Acute mountain sickness (AMS) is a common concern for mountain climbers who ascend higher than 2000 m. Characterized by headache, lightheadedness, fatigue, nausea, and insomnia, AMS is caused by a failure to adapt to the acute hypobaric hypoxia experienced at high altitudes. The drug acetazolamide has been used effectively to treat AMS; however, it has a variety of unpleasant side effects that can reduce compliance to taking it. Previous studies suggested that the herbal supplement ginkgo biloba might also be used to prevent AMS without side effects. To test this hypothesis, healthy western volunteers who were hiking Mt. Everest were randomized to one of four treatments: placebo, ginkgo biloba only, acetazolamide only or ginkgo biloba and acetazolamide [2]. Treatment group as well as incidence of AMS and incidence of headache for the 487 individuals who completed the experiment are presented in Treckers.csv. We wish to determine if ginkgo biloba is as effective in preventing AMS as acetazolamide.
+
+##### Project deliverables
+1. Import the Treckers.csv dataset. Open the data dictionary to identify each variable in the dataset as categorical or quantitative. If the variable is categorical, further identify it as ordinal, nominal, or an identifier variable. If the variable is quantitative, identify it as discrete or continuous. `(12 marks)`
+
+2. Create a subset that contains records of participants who were randomised to take ginkgo biloba only and acetazolamide only. **Hint:** Filter your original frame by (`fun key row -> row?Trt = 2 || row?Trt = 3`) in your F# code. We will use this subset to complete the rest of the deliverables. `(2 marks)`
+
+3. Create a new column called TrtChar that takes on the value GinkgoBiloba or Acetazolamide for individuals who were assigned to those treatments. Create another new column called AMSChar that takes on the value `Yes` for participants who developed AMS and `No` for participants who did not develop AMS. (You can filter using `AMS_out` if you wish.) `(2 marks)`
+
+4. What number and proportion of hikers developed AMS? `(2 marks)`
+
+5. Calculate the joint and marginal distributions of treatment and AMS. `(3 marks)`
+
+6. Determine the conditional distribution of the incidence of AMS by treatment. `(4 marks)`
+
+7. Display the results of Deliverable 6 in a side-by-side bar chart. `(1 mark)`
+
+8. What is the appropriate test to determine if the proportion of individuals who develop AMS while taking acetazolamide is the same as the proportion who develop AMS while taking ginkgo biloba? Verify that the assumptions for using this test are met. `(5 marks)`
+
+9. Write the hypotheses for the test you identified in Deliverable 8. `(2 marks)`
+
+10. Summarise your conclusions about the effectiveness of ginkgo biloba and acetazolamide as treatments for AMS. `(1 mark)`
+
+##### REFERENCE
+[2]. Gertsch, J. H., Basnyat, B., Johnson, E. W., Onopa, J., and Holck, P. S. (2005). “Randomized, Double-Blind Placebo Controlled Comparison of Ginkgo Biloba and Acetazolamide for Prevention of Acute Mountain Sickness Among Himalayan Trekkers: the Prevention of High Altitude Illness Trial,” British Medical Journal, Vol. 328, p. 797.
+
+#!fsharp
+
+//1. Import the Treckers.csv dataset. Open the data dictionary to identify each variable in the dataset as categorical or quantitative. If the variable is categorical, further identify it as ordinal, nominal, or an identifier variable. If the variable is quantitative, identify it as discrete or continuous. `(12 marks)`
+let Treckers = Frame.ReadCsv("Treckers.csv")//, separators=",")
+Treckers.Print()
+
+#!markdown
+
+ID is categorical identifier.
+(Categorical as its categorising items in the dataframe, its identifier as you use id to find and identify specidic rows)
+
+Trt is categorical ordinal.
+(Categorical as it encapsulates different treatments, its ordinal as there is numerical order to the treatments which mean different drugs, 1 = placebo, 2 = acetazolamide only, 3 = ginkgo biloba only, 4 = acetazolamide and ginkgo biloba)
+
+ACET is a categorical nominal.
+(Categorical as it represents a category as an indicator, its nominal as its size doesnt matter and grouped for taking acetazolamide, 0 = no, 1 = yes)
+
+Ginkgo is a categorical nominal.
+(Categorical as it represents a category as an indicator, its nominal as its size doesnt matter and grouped for taking ginkgo biloba, 0 = no, 1 = yes)
+
+AMS_out is a categorical nominal.
+(Categorical as it represents a category as an indicator, its Nominal as its true or false, there is no order and grouped for if the hiker has acute mountain sickness, 0 = no, 1 = yes)
+
+Headache_out is a categorical nominal.
+(Categorical as it represents a category as an indicator, its Nominal as its true or false, there is no order and grouped for if the hiker has a hedache, 0 = no, 1 = yes)
+
+#!fsharp
+
+//2. Create a subset that contains records of participants who were randomised to take ginkgo biloba only and acetazolamide only. **Hint:** Filter your original frame by (`fun key row -> row?Trt = 2 || row?Trt = 3`) in your F# code. We will use this subset to complete the rest of the deliverables. `(2 marks)`
+let Treckers_seriesGA = Treckers |> Frame.filterRows (fun key row -> row?Trt = 2 || row?Trt = 3)
+Treckers_seriesGA.Print()
+
+#!fsharp
+
+//3. Create a new column called TrtChar that takes on the value GinkgoBiloba or Acetazolamide for individuals who were assigned to those treatments. Create another new column called AMSChar that takes on the value `Yes` for participants who developed AMS and `No` for participants who did not develop AMS. (You can filter using `AMS_out` if you wish.) `(2 marks)`
+Treckers_seriesGA?TrtChar <- Treckers_seriesGA?Trt |> Series.mapValues (fun i -> if i = 3 then "GinkgoBiloba" else "Acetazolamide")
+Treckers_seriesGA?AMSChar <- Treckers_seriesGA?AMS_out |> Series.mapValues (fun i -> if i = 1 then "Yes" else "No")
+Treckers_seriesGA.Print()
+
+#!fsharp
+
+//4. What number and proportion of hikers developed AMS? `(2 marks)`, 
+let AMSChar_frequency =
+    Treckers_seriesGA
+    |> Frame.pivotTable
+        (fun k r -> r.GetAs<string>("AMSChar"))
+        (fun k r -> r.GetAs<int>("AMS_out"))
+        Frame.countRows
+
+AMSChar_frequency
+
+#!markdown
+
+[ No => series [ 0 => 185; 1 => <missing>]; Yes => series [ 0 => <missing>; 1 => 57]
+
+The above explains to us there are 185 No's and 57 Yes's for patients who developed AMS.
+
+Therefore within the records of hikers who were randomised to take ginkgo biloba only or acetazolamide only, 57 hikers developed AMS.
+
+#!fsharp
+
+let totalTreckers_seriesGA = Treckers_seriesGA.RowCount
+let AMSChar_series = Treckers_seriesGA.GetColumn<int>("AMS_out")  // Get column from the original data
+let yesAMS = AMSChar_series |> Series.filterValues (fun v -> v = 1) |> Series.countValues  // Compare with integer 1
+let noAMS = totalTreckers_seriesGA - yesAMS
+
+let AMSChar_frequency = Series.ofObservations [ "yes (%)" => (float yesAMS) * 100.0/(float totalTreckers_seriesGA); "no (%)" => (float noAMS) * 100.0/(float totalTreckers_seriesGA) ]
+AMSChar_frequency.Print()
+
+Chart.Bar(AMSChar_frequency |> Series.observations)
+|> Chart.withXAxisStyle (TitleText = "Percentage")
+|> Chart.withYAxisStyle (TitleText = "yes or no")
+
+#!markdown
+
+23.554%(3d.p) of hikers who took ginkgobiloba or acetazolamide devloped AMS
+
+#!fsharp
+
+//5. Calculate the joint and marginal distributions of treatment and AMS. `(3 marks)`
+
+let joint_and_marginal =
+    Treckers_seriesGA
+    |> Frame.pivotTable
+        (fun k r -> r.GetAs<string>("TrtChar"))
+        (fun k r -> r.GetAs<string>("AMSChar"))
+        Frame.countRows
+
+joint_and_marginal
+
+#!markdown
+
+Joint distribution of treatment and AMS:
+
+Out of 242 participants 185 did experience benefits but 57 hickers did not experience improvements.
+
+104 hikers on acetazolamide and 81 on ginkgo biloba did experience improvements.
+14 hikers on acetazolamide and 43 on ginkgo biloba didnt see any improvements.
+
+Marginal distributions of treatment and AMS:
+
+118 of hickers received acetazolamide, while 124 received ginkgo biloba.
+185 of hickers did not get AMS, while 57 did.
+
+#!fsharp
+
+Treckers_seriesGA.Print()
+//6. Determine the conditional distribution of the incidence of AMS by treatment. `(4 marks)`
+
+#!markdown
+
+#### PROJECT 3: What Factors Influence Mammal Sleep Patterns?
+
+All mammals sleep. As any college student who has pulled an all-nighter knows, going without sleep or trying to function on too little sleep has a host of deleterious effects. However, for something that is so clearly physiologically important, there is a great variety in sleep needs throughout the animal kingdom from animals that seem never to sleep to those who that seem never to wake (ahem, cats). Researchers recorded data on sleep duration as well as a set of ecological and constitutional variables for a selection of mammal species [3]. This data appears in the Sleep.csv dataset. We wish to examine the relationship between dreaming and nondreaming sleep time in this set of mammal species.
+
+##### Project deliverables:
+1. Import the Sleep.csv dataset. Open the data dictionary to identify each variable in the dataset as categorical or quantitative. If the variable is categorical, further identify it as ordinal, nominal, or an identifier variable. If the variable is quantitative, identify it as discrete or continuous. `(22 marks)` 
+
+2. Display the distribution of total sleep for the mammal species in the dataset and describe the distribution with some summary statistics: shortest sleep time, longest sleep time, mean sleep time, median sleep time and standard deviation. `(6 marks)`
+
+3. Plot the relationship between nondreaming and dreaming sleep. Do animals who spend more time in dreaming sleep also spend more time in nondreaming sleep or does dreaming sleep decrease as nondreaming sleep increases? Hint: Use Chart.Point. `(2 marks)`
+
+4. What is the appropriate method to model the relationship between time spent in nondreaming sleep and time spent in dreaming sleep? Verify that the assumptions for using this method are met. `(4 marks)`
+
+5. Determine the regression equation that relates time spent in non-dreaming sleep to time spent in dreaming sleep. Interpret the slope. "Hint: The x-axis variable should be non-dreaming sleep". `(3 marks)`
+
+6. Calculate and interpret the correlation and R2 describing the relationship between dreaming and nondreaming sleep time. Interpret both the correlation and R2. `(4 marks)`
+
+7. If a mammal species experiences 5 hours of nondreaming sleep a day, how many hours of dreaming sleep would we expect that animal to get on average? `(2 marks)`
+
+8. Calculate the difference in the number of hours spent in nondreaming and dreaming sleep for each mammal in the dataset. `(1 mark)`
+
+9. What is the appropriate test to determine if mammals spend the same or different numbers of hours in dreaming and nondreaming sleep? Verify that the assumptions for using this test are met. `(3 marks)`
+
+10. Write the hypotheses for the test you identified in Deliverable 9. `(2 marks)`
+
+11. Conduct the hypothesis test and report your conclusion at the 0.05 significance level. `(3 marks)`
+
+12. Create a 95% confidence interval for the mean difference in the number of hours a mammal spends in nondreaming and dreaming sleep. `(2 marks)`
+
+13. Summarise your findings about dreaming and nondreaming sleep in mammals. `(2 marks)`
+
+##### REFERENCE
+[3]. Allison, T. and Cicchetti, D. (1976), “Sleep in Mammals: Ecological and Constitutional Correlates,” Science, November 12, Vol. 194, pp. 732–734.
+
+#!fsharp
+
+//1. Import the Sleep.csv dataset. Open the data dictionary to identify each variable in the dataset as categorical or quantitative. If the variable is categorical, further identify it as ordinal, nominal, or an identifier variable. If the variable is quantitative, identify it as discrete or continuous. `(22 marks)`
+let Sleeps = Frame.ReadCsv("Sleep.csv")//, separators=",")
+Sleeps.Print()
+
+#!markdown
+
+Animal is categorical identifier.
+(Categorical as it represents its own species as an indicator, its identifier as you would use the animal name to find and identify what animal the data belongs, to find a species, use a string input)
+
+Brain is Quantitative continuous.
+(Qantitative as its weight is in kilograms, its continuous as kilograms can be any numeric number)
+
+Body is Quantitative continuous.
+(Qantitative as its weight is in grams, its continuous as grams can be any numeric number)
+
+SWsleep is Quantitative continuous.
+(Qantitative as its measurment is in hours, its continuous as Slow wave hours slept be any numeric number)
+
+Parasleep is Quantitative continuous.
+(Qantitative as its measurment is in hours, its continuous as Paradoxica hours slept can be any numeric number)
+
+Totsleep is Quantitative continuous.
+(Qantitative as its measurment is in hours, its continuous as total hours slept can be any numeric number)
+
+Life is quantitative continuous.
+(Qantitative as its measurment is in years, its continuous as life expectancy can be any numeric number)
+
+Gest is quantitative continuous.
+(Qantitative as its measurment is in days, its continuous as the gestation period can be any numeric number)
+
+Pred is categorical ordinal.
+(Categorical as it represents a category as an indicator, ordinal as having a better predation means a direct improvement to the animal's livelyhood and a lower chance of getting killed, the rankings are from [1 – 5] with 1 being the most desired)
+
+Exposure is categorical ordinal.
+(Categorical as it represents a category as an indicator, ordinal as less exposure as they sleep means a direct improvement to the animal's livelyhood and a lower chance of getting killed, the rankings are from [1 – 5] with 1 being the most desired)
+
+Danger is categorical ordinal.
+(Categorical as it represents a category as an indicator, ordinal as less danger from other animal's means a direct improvement to the animal's livelyhood and a lower chance of getting killed, the rankings are from [1 – 5] with 1 being the most desired)
+
+#!fsharp
+
+//2. Display the distribution of total sleep for the mammal species in the dataset and describe the distribution with some summary statistics: shortest sleep time, longest sleep time, mean sleep time, median sleep time and standard deviation. `(6 marks)`
+
+Chart.Histogram(Sleeps?Totsleep.Values) //, NBinsX=10)
+|> Chart.withXAxisStyle (TitleText = "Sleep hours")
+|> Chart.withYAxisStyle (TitleText = "Frequency")
+
+#!fsharp
+
+let TTotsleep = Sleeps?Totsleep
+Stats.describe TTotsleep
+
+#!markdown
+
+[mean, 10.642857142857142], [std, 4.709416765564185]
+
+The mean sleep time is 10.643 hours (3d.p) and a standard deviation of 4.709 hours (2d.p).
+
+[min, 2.9] [max, 19.9]
+
+Sleep time ranges from a minimum of 2.9 hours to a maximum of 19.9 hours.
+
+[0.75 => 13.6; 0.5 => 9.8; 0.25 => 8.05]
+
+Quarter 1 is at 8.05 hours, the mean at 9.8 hours and quarter 3 at 13.6.
+
+Thanks to the graph you can tell it somewhat normaly distrobuted, it doesnt fit a bell shape yet has some symetry.
+
+#!fsharp
+
+//3. Plot the relationship between nondreaming and dreaming sleep. Do animals who spend more time in dreaming sleep also spend more time in nondreaming sleep or does dreaming sleep decrease as nondreaming sleep increases? Hint: Use Chart.Point. `(2 marks)`
+
+
+let hoursND_series = Sleeps?SWsleep
+let hoursD_series = Sleeps?Parasleep
+
+let nondreamingDreaming =
+    Sleeps
+    |> Frame.pivotTable
+        (fun k r -> r.GetAs<string>("SWsleep"))
+        (fun k r -> r.GetAs<string>("Parasleep"))
+        Frame.countRows
+
+Chart.Point(hoursND_series |> Series.values, hoursD_series |> Series.values)
+|> Chart.withXAxisStyle (TitleText = "dreaming sleep hours")
+|> Chart.withYAxisStyle (TitleText = "non dreaming sleep hours")
+
+#!markdown
+
+The graph plottig dreaming sleep hours by non dreaming sleep hours has a mildly Mositive Increasing Trend with a Weak Correlation, I think this as the graph is at an incline yet there is a high varience.
+
+But to answer the question Yes, animals who spend more time in dreaming sleep do also end up spend more time in nondreaming sleep on average.
+
+#!fsharp
+
+//4.What is the appropriate method to model the relationship between time spent in nondreaming sleep and time spent in dreaming sleep? Verify that the assumptions for using this method are met. `(4 marks)`
+
+#!markdown
+
+After removing outliers specificaly, 
+It is clear theres a positive trend 
+
+![Alt text](image2.png)
+
+It is clear there is a Positive, Linear trend, and therfore it would be best to use a Linear Regression Model
+
+The assumptions for using this method are met are:
+
+There is constant linearity, all points have similar varience,
+
+There is a clear trend, the line of best fit shows it so,
+
+And errors are independent, there are only a couple of outlyers.
