@@ -7,9 +7,10 @@ RUN apt-get update && apt-get install -y python3-pip python3-venv && \
     /opt/venv/bin/pip install jupyter && \
     ln -s /opt/venv/bin/jupyter /usr/local/bin/jupyter
 
-# Install .NET Interactive (F# Kernel)
-RUN dotnet tool install --global Microsoft.dotnet-interactive --version 1.0.611002
-RUN dotnet interactive jupyter install
+# Install .NET Interactive (F# Kernel) and Jupyter
+RUN dotnet tool install --global Microsoft.dotnet-interactive --version 1.0.611002 && \
+    export PATH="$PATH:/root/.dotnet/tools" && \
+    dotnet interactive jupyter install
 
 # Set environment variables
 ENV PATH="${PATH}:/root/.dotnet/tools"
